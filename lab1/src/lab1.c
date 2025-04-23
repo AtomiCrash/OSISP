@@ -46,7 +46,14 @@ int dirwalk(char *path, char **files, int *count) {
             continue;
         }
 
-        if (snprintf(fullpath, sizeof(fullpath), "%s/%s", path, dir->d_name) >= (int)sizeof(fullpath)) {
+        int len = strlen(path);
+        if (len > 0 && path[len-1] == '/') {
+            snprintf(fullpath, sizeof(fullpath), "%s%s", path, dir->d_name);
+        } else {
+            snprintf(fullpath, sizeof(fullpath), "%s/%s", path, dir->d_name);
+        }
+
+        if (strlen(fullpath) >= sizeof(fullpath)) {
             fprintf(stderr, "Path too long: %s/%s\n", path, dir->d_name);
             continue;
         }
@@ -79,7 +86,7 @@ int main(int argc, char *argv[]) {
 
     char *files[MAX_FILES];
     int count = 0;
-    char *dir_path = ".";  // Изменено с "./" на "."
+    char *dir_path = ".";
 
     int opt;
     while ((opt = getopt(argc, argv, "sldf")) != -1) {
@@ -102,7 +109,6 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // Обработка аргумента каталога (может быть как до, так и после опций)
     if (optind < argc) {
         dir_path = argv[optind];
     }

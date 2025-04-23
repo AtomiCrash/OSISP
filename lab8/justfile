@@ -1,0 +1,63 @@
+# version
+version := '2.2.0'
+
+# variables
+c-extra-flags := '-Wno-unused'
+
+# constants
+cc := 'gcc'
+cd := 'gdb'
+ct := 'valgrind'
+c-standard := 'c23'
+c-common-flags := '-D_XOPEN_SOURCE=700 -std=' + c-standard + ' -pedantic -W -Wall -Wextra ' + c-extra-flags
+c-release-flags := c-common-flags + ' -Werror -O2'
+c-debug-flags := c-common-flags + ' -O1 -g -g' + cd
+
+# rules
+os-build-dir := './build' / os()
+project-name := `basename $(pwd)`
+just-self := just_executable() + ' --justfile ' + justfile()
+src-dir := 'src'
+
+_:
+    @ just --list
+
+_validate mode:
+    @ if [ '{{ mode }}' != 'debug' ] && [ '{{ mode }}' != 'release' ]; then echo '`mode` must be: `debug` or `release`, not `{{ mode }}`'; exit 1; fi
+
+# build project (`mode` must be: `debug` or `release`)
+build mode: (_validate mode)
+    @ mkdir -p '{{ os-build-dir / project-name }}'
+    @ {{ just-self }} '_build_{{ mode }}'
+
+_build_debug:
+    {{ cc }} {{ c-debug-flags }} {{ src-dir }}/server.c -o '{{ os-build-dir / project-name }}/server_debug' -lpthread
+    {{ cc }} {{ c-debug-flags }} {{ src-dir }}/client.c -o '{{ os-build-dir / project-name }}/client_debug'
+
+_build_release:
+    {{ cc }} {{ c-release-flags }} {{ src-dir }}/server.c -o '{{ os-build-dir / project-name }}/server' -lpthread
+    {{ cc }} {{ c-release-flags }} {{ src-dir }}/client.c -o '{{ os-build-dir / project-name }}/client'
+
+# execute project's binary (specify which program to run)
+run program mode *args: (build mode)
+    '{{ os-build-dir / project-name }}/{{ program }}_{{ mode }}' {{ args }}
+
+# start debugger
+debug program: (build 'debug')
+    {{ cd }} '{{ os-build-dir / project-name }}/{{ program }}_debug'
+
+# clean project's `build` directory
+clean:
+    rm -rf '{{ os-build-dir }}'
+
+# run a memory error detector `valgrind`
+test program mode *args: (build mode)
+    {{ ct }} --leak-check=full --show-leak-kinds=all --track-origins=yes '{{ os-build-dir / project-name }}/{{ program }}_{{ mode }}' {{ args }}
+
+# start server (with root dir and port)
+start-server mode root port: (build mode)
+    '{{ os-build-dir / project-name }}/server_{{ mode }}' {{ root }} {{ port }}
+
+# connect client to server
+connect-client mode host port: (build mode)
+    '{{ os-build-dir / project-name }}/client_{{ mode }}' {{ host }} {{ port }}

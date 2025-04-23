@@ -2,120 +2,260 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
+#include <dirent.h>
 #include <string.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <errno.h>
+#include <limits.h>
 
-#define MAX_FILES 10
-#define MAX_PROGRAMS 5
-#define MAX_ARGS 10
-#define MAX_PROCESSES 5  // Максимальное количество одновременно выполняемых процессов
+#define MAX_ARGS 20
+#define BUFFER_SIZE 1024
 
-/*void process_file(const char *file, const char *program, char *const args[]) {
-    pid_t pid = fork();
-    if (pid == 0) {
-        // Дочерний процесс
-        execvp(program, args);
-        // Если execvp вернул управление, значит произошла ошибка
-        perror("execvp");
-        exit(EXIT_FAILURE);
-    } else if (pid < 0) {
-        // Ошибка при создании процесса
-        perror("fork");
+typedef struct {
+    char *name;
+    char **args;
+    int arg_count;
+    char **file_patterns;
+    int pattern_count;
+} ProgramInfo;
+
+int compare_files(const char *file1, const char *file2) {
+    struct stat st1, st2;
+    if (stat(file1, &st1) != 0 || stat(file2, &st2) != 0) {
+        return -1;
     }
-}*/
+
+    if (st1.st_size != st2.st_size) return 1;
+
+    int fd1 = open(file1, O_RDONLY);
+    if (fd1 < 0) return -1;
+
+    int fd2 = open(file2, O_RDONLY);
+    if (fd2 < 0) {
+        close(fd1);
+        return -1;
+    }
+
+    char *map1 = mmap(NULL, st1.st_size, PROT_READ, MAP_PRIVATE, fd1, 0);
+    char *map2 = mmap(NULL, st2.st_size, PROT_READ, MAP_PRIVATE, fd2, 0);
+
+    if (map1 == MAP_FAILED || map2 == MAP_FAILED) {
+        if (map1 != MAP_FAILED) munmap(map1, st1.st_size);
+        if (map2 != MAP_FAILED) munmap(map2, st2.st_size);
+        close(fd1);
+        close(fd2);
+        return -1;
+    }
+
+    int result = memcmp(map1, map2, st1.st_size);
+
+    munmap(map1, st1.st_size);
+    munmap(map2, st2.st_size);
+    close(fd1);
+    close(fd2);
+
+    return result;
+}
+
+int copy_file(const char *src, const char *dst) {
+    FILE *source = fopen(src, "rb");
+    if (!source) return -1;
+
+    FILE *dest = fopen(dst, "wb");
+    if (!dest) {
+        fclose(source);
+        return -1;
+    }
+
+    char buffer[BUFFER_SIZE];
+    size_t bytes;
+
+    while ((bytes = fread(buffer, 1, BUFFER_SIZE, source)) > 0) {
+        if (fwrite(buffer, 1, bytes, dest) != bytes) {
+            fclose(source);
+            fclose(dest);
+            remove(dst);
+            return -1;
+        }
+    }
+
+    fclose(source);
+    fclose(dest);
+    return 0;
+}
+
+void free_programs(ProgramInfo *programs, int count) {
+    for (int i = 0; i < count; i++) {
+        free(programs[i].args);
+        for (int j = 0; j < programs[i].pattern_count; j++) {
+            free(programs[i].file_patterns[j]);
+        }
+        free(programs[i].file_patterns);
+    }
+    free(programs);
+}
 
 int main(int argc, char *argv[]) {
     if (argc < 3) {
-        fprintf(stderr, "Использование: %s <программа1> [аргументы программы1] -- <программа2> [аргументы программы2] -- ... -- <файл1> <файл2> ...\n", argv[0]);
+        fprintf(stderr, "Usage: %s <directory> <program1> [args...] [--files patterns...] -- ...\n", argv[0]);
         exit(EXIT_FAILURE);
     }
 
-    // Массивы для хранения программ, их аргументов и файлов
-    char *programs[MAX_PROGRAMS];
-    char *args[MAX_PROGRAMS][MAX_ARGS];
-    char *files[MAX_FILES];
-    int num_programs = 0;
-    int num_files = 0;
+    char *directory = argv[1];
+    DIR *dir = opendir(directory);
+    if (!dir) {
+        perror("Error opening directory");
+        exit(EXIT_FAILURE);
+    }
+    closedir(dir);
 
-    // Разбор аргументов командной строки
-    int i = 1;
+    ProgramInfo *programs = NULL;
+    int num_programs = 0;
+    int i = 2;
+
     while (i < argc) {
-        if (strcmp(argv[i], "--") == 0) {
-            // Разделитель между программами
+        programs = realloc(programs, (num_programs + 1) * sizeof(ProgramInfo));
+        if (!programs) {
+            perror("Memory allocation failed");
+            exit(EXIT_FAILURE);
+        }
+
+        ProgramInfo *current = &programs[num_programs];
+        current->name = argv[i++];
+        current->args = malloc(MAX_ARGS * sizeof(char*));
+        current->arg_count = 0;
+        current->file_patterns = NULL;
+        current->pattern_count = 0;
+
+        current->args[current->arg_count++] = current->name;
+
+        while (i < argc && strcmp(argv[i], "--files") != 0 && strcmp(argv[i], "--") != 0) {
+            if (current->arg_count >= MAX_ARGS - 1) {
+                fprintf(stderr, "Too many arguments for program %s\n", current->name);
+                exit(EXIT_FAILURE);
+            }
+            current->args[current->arg_count++] = argv[i++];
+        }
+        current->args[current->arg_count] = NULL;
+
+        if (i < argc && strcmp(argv[i], "--files") == 0) {
             i++;
-        } else if (strchr(argv[i], '.') != NULL) {
-            // Аргумент считается файлом, если содержит точку
-            if (num_files >= MAX_FILES) {
-                fprintf(stderr, "Слишком много файлов. Максимум %d файлов.\n", MAX_FILES);
-                exit(EXIT_FAILURE);
-            }
-            files[num_files++] = argv[i++];
-        } else {
-            // Аргумент считается программой и её параметрами
-            if (num_programs >= MAX_PROGRAMS) {
-                fprintf(stderr, "Слишком много программ. Максимум %d программ.\n", MAX_PROGRAMS);
-                exit(EXIT_FAILURE);
-            }
-            programs[num_programs] = argv[i++];
-            int arg_count = 0;
-            args[num_programs][arg_count++] = programs[num_programs];
-            while (i < argc && strcmp(argv[i], "--") != 0 && strchr(argv[i], '.') == NULL) {
-                if (arg_count >= MAX_ARGS - 1) {
-                    fprintf(stderr, "Слишком много аргументов для программы. Максимум %d аргументов.\n", MAX_ARGS - 1);
+            while (i < argc && strcmp(argv[i], "--") != 0) {
+                current->file_patterns = realloc(current->file_patterns, 
+                                               (current->pattern_count + 1) * sizeof(char*));
+                if (!current->file_patterns) {
+                    perror("Memory allocation failed");
                     exit(EXIT_FAILURE);
                 }
-                args[num_programs][arg_count++] = argv[i++];
+                current->file_patterns[current->pattern_count++] = strdup(argv[i++]);
             }
-            args[num_programs][arg_count] = NULL;  // Завершаем массив аргументов NULL
-            num_programs++;
         }
+
+        if (i < argc && strcmp(argv[i], "--") == 0) {
+            i++;
+        }
+
+        num_programs++;
     }
 
-    if (num_programs == 0 || num_files == 0) {
-        fprintf(stderr, "Не указаны программы или файлы.\n");
+    struct dirent **file_list;
+    int num_files = scandir(directory, &file_list, NULL, alphasort);
+    if (num_files < 0) {
+        perror("Error reading directory");
         exit(EXIT_FAILURE);
     }
 
-    int active_processes = 0;  // Счетчик активных процессов
+    for (int f = 0; f < num_files; f++) {
+        if (file_list[f]->d_type != DT_REG) {
+            free(file_list[f]);
+            continue;
+        }
 
-    // Обрабатываем каждый файл каждой программой
-    for (int i = 0; i < num_files; i++) {
-        for (int j = 0; j < num_programs; j++) {
-            // Ожидаем, если количество активных процессов достигло максимума
-            while (active_processes >= MAX_PROCESSES) {
-                wait(NULL);  // Ожидаем завершения любого дочернего процесса
-                active_processes--;
+        char *filename = file_list[f]->d_name;
+        char src_path[PATH_MAX];
+        snprintf(src_path, sizeof(src_path), "%s/%s", directory, filename);
+
+        for (int p = 0; p < num_programs; p++) {
+            ProgramInfo *prog = &programs[p];
+
+            if (prog->pattern_count > 0) {
+                int match = 0;
+                for (int pat = 0; pat < prog->pattern_count; pat++) {
+                    if (strstr(filename, prog->file_patterns[pat]) != NULL) {
+                        match = 1;
+                        break;
+                    }
+                }
+                if (!match) continue;
             }
 
-            // Создаем массив аргументов для текущего файла
-            char *file_args[MAX_ARGS + 1];
+            char dst_path[PATH_MAX];
+            snprintf(dst_path, sizeof(dst_path), "%s/%s_%s", directory, filename, prog->name);
+
+            if (copy_file(src_path, dst_path) != 0) {
+                fprintf(stderr, "Failed to copy %s to %s\n", src_path, dst_path);
+                continue;
+            }
+
+            char *exec_args[MAX_ARGS + 2];
             int arg_count = 0;
-            for (int k = 0; args[j][k] != NULL; k++) {
-                file_args[arg_count++] = args[j][k];
+            for (int a = 0; a < prog->arg_count; a++) {
+                exec_args[arg_count++] = prog->args[a];
             }
-            file_args[arg_count++] = files[i];
-            file_args[arg_count] = NULL;  // Завершаем массив аргументов NULL
+            exec_args[arg_count++] = dst_path;
+            exec_args[arg_count] = NULL;
 
-            // Запускаем процесс
             pid_t pid = fork();
             if (pid == 0) {
-                // Дочерний процесс
-                execvp(programs[j], file_args);
-                perror("execvp");
+                execvp(prog->name, exec_args);
+                perror("execvp failed");
                 exit(EXIT_FAILURE);
             } else if (pid < 0) {
-                perror("fork");
-            } else {
-                active_processes++;  // Увеличиваем счетчик активных процессов
+                perror("fork failed");
             }
         }
+        free(file_list[f]);
+    }
+    free(file_list);
+
+    while (wait(NULL) > 0 || errno != ECHILD);
+
+    dir = opendir(directory);
+    if (!dir) {
+        perror("Error opening directory for cleanup");
+        exit(EXIT_FAILURE);
     }
 
-    // Ожидаем завершения всех оставшихся процессов
-    while (active_processes > 0) {
-        wait(NULL);
-        active_processes--;
-    }
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type != DT_REG) continue;
 
-    printf("Все файлы обработаны всеми программами.\n");
+        char *filename = entry->d_name;
+        char *underscore = strrchr(filename, '_');
+        if (!underscore) continue;
+
+        *underscore = '\0';
+        char *program_name = underscore + 1;
+
+        char original_path[PATH_MAX];
+        snprintf(original_path, sizeof(original_path), "%s/%s", directory, filename);
+
+        char copy_path[PATH_MAX];
+        snprintf(copy_path, sizeof(copy_path), "%s/%s_%s", directory, filename, program_name);
+
+        if (access(copy_path, F_OK) == 0) {
+            if (compare_files(original_path, copy_path) == 0) {
+                remove(copy_path);
+            }
+        }
+        *underscore = '_'; 
+    }
+    closedir(dir);
+
+    free_programs(programs, num_programs);
+
+    printf("All files processed successfully.\n");
     return 0;
 }
