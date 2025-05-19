@@ -1,3 +1,5 @@
+// access_manager.c
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -13,8 +15,8 @@
 #include <sys/mman.h>
 #include <openssl/md5.h>
 
+#define MAX_ARGS 20
 #define BUFFER_SIZE 1024
-#define MAX_PARALLEL_PROCESSES 10 
 
 typedef struct {
     char *name;
@@ -22,9 +24,9 @@ typedef struct {
     int arg_count;
     char **file_patterns;
     int pattern_count;
-    char **processed_files;
+    char **processed_files;  // Для хранения файлов, обработанных каждой программой
     int processed_count;
-    char *output;
+    char *output;  // Для хранения вывода программы
 } ProgramInfo;
 
 void handle_error(const char *msg, int critical) {
@@ -110,7 +112,7 @@ void execute_program(const char *filepath, ProgramInfo *prog, const char *output
         dup2(fd, STDERR_FILENO);
         close(fd);
 
-        char **exec_args = malloc((prog->arg_count + 2) * sizeof(char *));
+        char *exec_args[MAX_ARGS + 2];
         int n = 0;
         for (int i = 0; i < prog->arg_count; i++) {
             exec_args[n++] = prog->args[i];
@@ -119,15 +121,16 @@ void execute_program(const char *filepath, ProgramInfo *prog, const char *output
         exec_args[n] = NULL;
 
         execvp(prog->name, exec_args);
-        free(exec_args);
         exit(1);
     }
 }
 
 void print_output_and_remove(const char *path, ProgramInfo *prog) {
+    // Открываем временный файл для чтения
     FILE *f = fopen(path, "r");
     if (!f) return;
 
+    // Сохраняем вывод программы в строке
     char line[BUFFER_SIZE];
     char *output = malloc(1);
     output[0] = '\0';
@@ -137,6 +140,7 @@ void print_output_and_remove(const char *path, ProgramInfo *prog) {
     }
     fclose(f);
 
+    // Добавляем вывод программы в её общий вывод
     if (prog->output == NULL) {
         prog->output = output;
     } else {
@@ -145,6 +149,7 @@ void print_output_and_remove(const char *path, ProgramInfo *prog) {
         free(output);
     }
 
+    // Удаляем временный файл после вывода
     remove(path);
 }
 
@@ -174,9 +179,9 @@ int main(int argc, char *argv[]) {
         programs = realloc(programs, sizeof(ProgramInfo) * (prog_count + 1));
         ProgramInfo *p = &programs[prog_count++];
         p->name = argv[i++];
-        p->args = malloc(sizeof(char*) * 2); 
-        p->arg_count = 1;
-        p->args[0] = p->name;
+        p->args = malloc(sizeof(char*) * MAX_ARGS);
+        p->arg_count = 0;
+        p->args[p->arg_count++] = p->name;
         p->file_patterns = NULL;
         p->pattern_count = 0;
         p->processed_files = NULL;
@@ -184,7 +189,6 @@ int main(int argc, char *argv[]) {
         p->output = NULL;
 
         while (i < argc && strcmp(argv[i], "--") && strcmp(argv[i], "--files")) {
-            p->args = realloc(p->args, sizeof(char*) * (p->arg_count + 1)); 
             p->args[p->arg_count++] = argv[i++];
         }
 
@@ -200,8 +204,6 @@ int main(int argc, char *argv[]) {
     struct dirent **namelist;
     int n = scandir(directory, &namelist, NULL, alphasort);
     if (n < 0) handle_error("scandir failed", 1);
-
-    int active_processes = 0;
 
     for (int f = 0; f < n; f++) {
         if (namelist[f]->d_type != DT_REG) {
@@ -242,25 +244,19 @@ int main(int argc, char *argv[]) {
             char temp_out[PATH_MAX];
             snprintf(temp_out, sizeof(temp_out), "%s.out", copypath);
 
-            while (active_processes >= MAX_PARALLEL_PROCESSES) {
-                wait(NULL);
-                active_processes--;
-            }
-
             execute_program(copypath, prog, temp_out);
-            active_processes++;
-
             int status;
             wait(&status);
-            active_processes--;
 
             char *after_hash = get_md5_hash(copypath);
             if (before_hash && after_hash && strcmp(before_hash, after_hash) == 0) {
                 remove(copypath);
             }
 
+            // Сохраняем вывод программы
             print_output_and_remove(temp_out, prog);
 
+            // Сохраняем имя файла для программы
             prog->processed_files = realloc(prog->processed_files, sizeof(char*) * (prog->processed_count + 1));
             prog->processed_files[prog->processed_count++] = strdup(modname);
 
@@ -277,6 +273,7 @@ int main(int argc, char *argv[]) {
         rmdir(copy_dir);
     }
 
+    // Выводим результаты по программам
     for (int p = 0; p < prog_count; p++) {
         ProgramInfo *prog = &programs[p];
         if (prog->output) {
@@ -286,6 +283,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    // Освобождаем память
     for (int p = 0; p < prog_count; p++) {
         free(programs[p].args);
         for (int j = 0; j < programs[p].pattern_count; j++) {

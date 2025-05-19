@@ -1,3 +1,7 @@
 ./Access_manager ~/projects/Accessmanager sort -u --files .txt
 
 ./Access_manager ~/projects/Accessmanager sed -i 's/test/tests/g' --files .txt
+
+./Access_manager ./test     wc -l --files .txt .log --     grep error --files .log --     cat --     head -n 5 --files .txt --     md5sum --
+
+./Access_manager ~/projects/Accessmanager/test     sed -i s/test/TEST/g --files .txt --     perl -pi -e 's/Hello/Hi/g' --files .txt --
